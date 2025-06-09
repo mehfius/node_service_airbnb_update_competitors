@@ -2,8 +2,8 @@
 const puppeteer = require('puppeteer');
 const { createClient } = require('@supabase/supabase-js');
 const dotenv = require('dotenv');
+const { maxPages } = require('./config');
 
-// Carregar variáveis de ambiente
 dotenv.config();
 
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -54,7 +54,6 @@ function buildAirbnbUrl(params) {
 
 async function getAirbnbListingDetails(params) {
     const airbnbUrl = buildAirbnbUrl(params);
-    console.log('URL de Scraping Gerada:', airbnbUrl);
     let browser;
     try {
         browser = await puppeteer.launch({
@@ -72,11 +71,9 @@ async function getAirbnbListingDetails(params) {
         const page = await browser.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setViewport({ width: 1440, height: 900 });
-        console.log('Navegando para a URL:', airbnbUrl);
         await page.goto(airbnbUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
         const itemSelector = 'div[itemprop="itemListElement"]';
         const expectedMinCount = 18;
-        console.log(`Aguardando até que haja pelo menos ${expectedMinCount} elementos com o seletor '${itemSelector}'...`);
         try {
             await page.waitForFunction(
                 (selector, expectedCount) => {
@@ -86,18 +83,14 @@ async function getAirbnbListingDetails(params) {
                 itemSelector,
                 expectedMinCount
             );
-            console.log(`Pelo menos ${expectedMinCount} elementos encontrados ou tempo limite alcançado.`);
-            console.log('Simulando rolagem para garantir que todos os elementos sejam carregados...');
             for (let i = 0; i < 3; i++) {
                 await page.evaluate(() => {
                     window.scrollBy(0, window.innerHeight * 0.8);
                 });
                 await page.waitForTimeout(1500);
             }
-            console.log('Pausa final de 2 segundos antes da extração...');
             await page.waitForTimeout(2000);
         } catch (waitError) {
-            console.warn(`Aviso: Erro ao esperar pelos elementos: ${waitError.message}. Tentando extrair o que foi carregado.`);
         }
         const listings = await page.evaluate((selector) => {
             const elements = document.querySelectorAll(selector);
@@ -120,7 +113,6 @@ async function getAirbnbListingDetails(params) {
                     }
                 }
 
-                // Capturar total_reviews e score
                 let totalReviews = null;
                 let score = null;
                 const targetSvg = el.querySelector('svg:has(path[fill-rule="evenodd"])');
@@ -134,8 +126,8 @@ async function getAirbnbListingDetails(params) {
                                 const textContent = ratingSpan.textContent.trim();
                                 const match = textContent.match(/(\d+,\d+)\s*\((\d+)\)/);
                                 if (match) {
-                                    score = parseFloat(match[1].replace(',', '.')); // Converte "5,0" para 5.0
-                                    totalReviews = parseInt(match[2], 10); // Converte "4" para 4
+                                    score = parseFloat(match[1].replace(',', '.'));
+                                    totalReviews = parseInt(match[2], 10);
                                 }
                             }
                         }
@@ -153,52 +145,77 @@ async function getAirbnbListingDetails(params) {
             });
             return data;
         }, itemSelector);
-        console.log(`Total de listings encontrados: ${listings.length}`);
-        console.log('Detalhes dos listings:', listings);
         return listings;
     } catch (error) {
-        console.error('Ocorreu um erro geral durante o scraping:', error);
         return null;
     } finally {
         if (browser) {
             await browser.close();
-            console.log('Navegador fechado.');
         }
     }
 }
 
 async function insertScrapedData(data) {
     try {
-        console.log('Dados a serem inseridos ou atualizados:', data); // Log dos dados
         const { data: upsertedData, error } = await supabase
-            .from('competitors') // Atualiza a tabela para 'competitors'
-            .upsert(data, { onConflict: ['room_id'] }); // Define o campo único para upsert
+            .from('competitors')
+            .upsert(data, { onConflict: ['room_id'] });
 
         if (error) {
-            console.error('Erro ao inserir ou atualizar dados:', error);
-            throw new Error(`Erro ao inserir ou atualizar dados no Supabase: ${error.message}`); // Gera erro explícito
-        } else {
-            console.log('Dados inseridos ou atualizados com sucesso:', upsertedData); // Log dos dados inseridos ou atualizados
+            throw new Error(`Erro ao inserir ou atualizar dados no Supabase: ${error.message}`);
         }
     } catch (err) {
-        console.error('Erro inesperado:', err);
-        throw err; // Propaga o erro para o chamador
+        throw err;
     }
 }
 
 async function scrapeAndSave(params) {
-    const scrapedData = await getAirbnbListingDetails(params);
+    console.log('Valor inicial de params.cursor:', params.cursor); // Log para inspecionar o valor inicial
 
-    const formattedData = scrapedData.map(item => ({
-        room_id: item.roomId,
-        title: item.name, // Apenas os campos room_id e title
-        total_reviews: item.total_reviews, // Adiciona total_reviews
-        score: item.score // Adiciona score
-    }));
+    let currentPage = 0;
 
-    console.log('Dados formatados para inserção:', formattedData); // Log dos dados formatados
+    while (currentPage < maxPages) {
 
-    await insertScrapedData(formattedData);
+        // Adicionar verificação para não usar o cursor na primeira página
+        if (currentPage === 0) {
+            delete params.cursor;
+        } else {
+            // Incrementar o offset do cursor em 18 para páginas subsequentes
+            const offset = 18 * currentPage;
+            const cursorObject = {
+                section_offset: 0,
+                items_offset: offset,
+                version: 1
+            };
+            params.cursor = Buffer.from(JSON.stringify(cursorObject)).toString('base64');
+        }
+
+        const scrapedData = await getAirbnbListingDetails(params);
+
+        if (!scrapedData || scrapedData.length === 0) {
+            console.warn('Nenhum dado encontrado nesta página. Encerrando a execução.');
+            break;
+        }
+
+        // Calcular a posição de cada item com base na página atual
+        const formattedData = scrapedData.map((item, index) => ({
+            room_id: item.roomId,
+            title: item.name,
+            total_reviews: item.total_reviews,
+            score: item.score,
+            position: currentPage * 18 + index + 1 // Posição global do item
+        }));
+
+        await insertScrapedData(formattedData);
+        
+        console.log(`Página atual: ${currentPage + 1}`);
+        console.log(`Room IDs encontrados: ${scrapedData.map(item => item.roomId).join(', ')}`);
+        console.log(`Cursor atual (base64): ${params.cursor}`);
+
+        currentPage++;
+
+        await new Promise(resolve => setTimeout(resolve, 2000));
+    }
 }
 
 module.exports = { getAirbnbListingDetails, scrapeAndSave };
